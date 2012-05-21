@@ -18,6 +18,8 @@ class TagsDeclInfo
 {
 public:
   int id;
+  std::string filename;
+  std::string text;
   int line_no;
   int col_no;
   std::string name;
@@ -42,10 +44,13 @@ const char * tags_sql = "                                        \
 CREATE TABLE SourcePaths (                                       \
     id INTEGER PRIMARY KEY,                                      \
                                                                  \
-    pathname VARCHAR(4096) NOT NULL                              \
+    dirname VARCHAR(4096) NOT NULL,                              \
+    pathname VARCHAR(256) NOT NULL                               \
 );                                                               \
 CREATE UNIQUE INDEX SourcePaths_id_idx                           \
     ON SourcePaths (id);                                         \
+CREATE INDEX SourcePaths_pathname_idx                            \
+    ON SourcePaths (pathname);                                   \
                                                                  \
 CREATE TABLE SourceLines (                                       \
     id INTEGER PRIMARY KEY,                                      \
@@ -75,10 +80,13 @@ INSERT INTO DeclKinds (description) VALUES (\"namespace\");      \
 CREATE TABLE SymbolNames (                                       \
     id INTEGER PRIMARY KEY,                                      \
                                                                  \
+    short_name TEXT NOT NULL,                                    \
     full_name  TEXT NOT NULL                                     \
 );                                                               \
 CREATE UNIQUE INDEX SymbolNames_id_idx                           \
     ON SymbolNames (id);                                         \
+CREATE UNIQUE INDEX SymbolNames_short_name_idx                   \
+    ON SymbolNames (short_name);                                 \
 CREATE UNIQUE INDEX SymbolNames_full_name_idx                    \
     ON SymbolNames (full_name);                                  \
                                                                  \
@@ -197,7 +205,7 @@ public:
 
     FileID file_id = FullLocation.getFileID();
     const FileEntry * file_entry =
-      Context->getSourceManager().getFileEntryForID(file_id);
+      FullLocation.getManager().getFileEntryForID(file_id);
     if (! file_entry)
       return;
 
@@ -205,16 +213,25 @@ public:
 
     sql << "BEGIN TRANSACTION;\n";
 
-    sql << "INSERT INTO SourcePaths (pathname)"
-        << "    VALUES ('" << file_entry->getName() << "');\n";
+    sql << "INSERT INTO SourcePaths (dirname, pathname)"
+        << "    VALUES ('" << file_entry->getDir()->getName() << "', '"
+        <<              file_entry->getName() << "');\n";
+
+    std::pair<FileID, unsigned> LocInfo = FullLocation.getDecomposedLoc();
+
+    const llvm::MemoryBuffer *Buffer = FullLocation.getBuffer();
+    const char * BufferStart = Buffer->getBufferStart();
+    std::size_t offset =
+      LocInfo.second - (FullLocation.getSpellingColumnNumber() - 1);
 
     sql << "INSERT INTO SourceLines (source_path_id, lineno, text)"
         << "    VALUES (last_insert_rowid(), "
-        << FullLocation.getSpellingLineNumber() << ", '<text goes here>');\n";
+        <<              FullLocation.getSpellingLineNumber() << ", '"
+        <<              (BufferStart + offset) << "');\n";
 
-    sql << "INSERT INTO SymbolNames (full_name)"
-        << "    VALUES ('" << Declaration->getQualifiedNameAsString()
-        << "');\n";
+    sql << "INSERT INTO SymbolNames (short_name, full_name)"
+        << "    VALUES ('" << Declaration->getNameAsString() << "', '"
+        <<              Declaration->getQualifiedNameAsString() << "');\n";
 
     sql << "INSERT INTO Declarations (symbol_name_id, kind_id, is_definition)"
         << "    VALUES (last_insert_rowid(), 1, 1);\n";
@@ -222,8 +239,8 @@ public:
     sql << "INSERT INTO DeclRefs ("
         << "  declaration_id, ref_kind_id, source_line_id, colno, is_implicit)"
         << "    VALUES (last_insert_rowid(), 1,"
-        << "      (SELECT COUNT(*) FROM SourceLines), "
-        << FullLocation.getSpellingColumnNumber() << ", 0);\n";
+        << "            (SELECT COUNT(*) FROM SourceLines), "
+        <<              FullLocation.getSpellingColumnNumber() << ", 0);\n";
     
     sql << "COMMIT;\n";
 
@@ -244,29 +261,33 @@ public:
   {
     std::ostringstream sql;
 
-    sql << "                                  \
-SELECT                                        \
-    Declarations.id,                          \
-    SourceLines.lineno,                       \
-    DeclRefs.colno                            \
-FROM                                          \
-    DeclRefs,                                 \
-    Declarations,                             \
-    SourceLines                               \
-WHERE                                         \
-    DeclRefs.declaration_id = Declarations.id \
-AND DeclRefs.source_line_id = SourceLines.id  \
-AND Declarations.symbol_name_id =             \
-    (                                         \
-        SELECT                                \
-            id                                \
-        FROM                                  \
-            SymbolNames                       \
-        WHERE                                 \
+    sql << "\
+SELECT                                            \
+    Declarations.id,                              \
+    SourcePaths.dirname,                          \
+    SourcePaths.pathname,                         \
+    SourceLines.lineno,                           \
+    DeclRefs.colno,                               \
+    SourceLines.text                              \
+FROM                                              \
+    DeclRefs,                                     \
+    Declarations,                                 \
+    SourcePaths,                                  \
+    SourceLines                                   \
+WHERE                                             \
+    DeclRefs.declaration_id     = Declarations.id \
+AND DeclRefs.source_line_id     = SourceLines.id  \
+AND SourceLines.source_path_id  = SourcePaths.id  \
+AND Declarations.symbol_name_id =                 \
+    (                                             \
+        SELECT                                    \
+            id                                    \
+        FROM                                      \
+            SymbolNames                           \
+        WHERE                                     \
             full_name = '" << name << "');\n";
 
     std::string query(sql.str());
-    char * error_msg;
     try {
       sqlite3_stmt *stmt;
       sql_chk(sqlite3_prepare(
@@ -275,10 +296,16 @@ AND Declarations.symbol_name_id =             \
       std::vector<TagsDeclInfo> tags;
       while (sqlite3_step(stmt) == SQLITE_ROW) {
         TagsDeclInfo info;
-        info.name    = name;
-        info.id      = sqlite3_column_int(stmt, 0);
-        info.line_no = sqlite3_column_int(stmt, 1);
-        info.col_no  = sqlite3_column_int(stmt, 2);
+        info.name     = name;
+        info.id       = sqlite3_column_int(stmt, 0);
+        info.filename =
+          (std::string(
+            reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)))
+           + "/" + reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2)));
+        info.line_no  = sqlite3_column_int(stmt, 3);
+        info.col_no   = sqlite3_column_int(stmt, 4);
+        info.text     = (reinterpret_cast<const char *>(
+                           sqlite3_column_text(stmt, 5)));
         tags.push_back(info);
       }
 
@@ -286,7 +313,6 @@ AND Declarations.symbol_name_id =             \
       return tags;
     }
     catch (const std::exception& err) {
-      std::cerr << "SQLite3 error: " << error_msg << std::endl;
       std::cerr << "Error occurred with the following query: "
                 << std::endl << query << std::endl;
       throw;
@@ -349,7 +375,8 @@ int main(int argc, char **argv) {
       for (std::vector<TagsDeclInfo>::const_iterator i = tags.begin();
            i != tags.end();
            ++i)
-        std::cout << (*i).line_no << ":" << (*i).col_no << ": " << (*i).name
+        std::cout << (*i).filename << ":"
+                  << (*i).line_no << ":" << (*i).col_no << ":" << (*i).text
                   << std::endl;
     } else {
       clang::tooling::runToolOnCode(new TagsClassAction(argv[1]), argv[2]);

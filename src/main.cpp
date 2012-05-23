@@ -64,12 +64,14 @@ CREATE TABLE SourceLines (                                              \
                                                                         \
     source_path_id INTEGER NOT NULL,                                    \
     lineno         INTEGER NOT NULL,                                    \
-    text           TEXT NOT NULL,                                       \
+    text           TEXT,                                                \
                                                                         \
     FOREIGN KEY(source_path_id) REFERENCES SourcePaths(id)              \
 );                                                                      \
 CREATE UNIQUE INDEX SourceLines_id_idx                                  \
     ON SourceLines (id);                                                \
+CREATE UNIQUE INDEX SourceLines_all_idx                                 \
+    ON SourceLines (source_path_id, lineno);                            \
                                                                         \
 CREATE TABLE DeclKinds (                                                \
     id INTEGER PRIMARY KEY,                                             \
@@ -102,9 +104,10 @@ CREATE UNIQUE INDEX SymbolNames_all_idx                                 \
 CREATE TABLE Declarations (                                             \
     id INTEGER PRIMARY KEY,                                             \
                                                                         \
-    symbol_name_id TEXT NOT NULL,                                       \
-    kind_id        INTEGER NOT NULL,                                    \
-    is_definition  INTEGER NOT NULL,                                    \
+    symbol_name_id         TEXT NOT NULL,                               \
+    kind_id                INTEGER NOT NULL,                            \
+    is_definition          INTEGER NOT NULL,                            \
+    is_implicitly_defined  INTEGER NOT NULL,                            \
                                                                         \
     FOREIGN KEY(symbol_name_id) REFERENCES SymbolNames(id),             \
     FOREIGN KEY(kind_id)        REFERENCES DeclKinds(id)                \
@@ -156,6 +159,9 @@ CREATE INDEX DeclRefs_line_col_idx                                      \
     ON DeclRefs (source_line_id, colno);                                \
 CREATE INDEX DeclRefs_is_implicit_idx                                   \
     ON DeclRefs (is_implicit);                                          \
+CREATE INDEX DeclRefs_all_idx                                           \
+    ON DeclRefs (declaration_id, ref_kind_id, source_line_id, colno,    \
+                 is_implicit);                                          \
                                                                         \
 CREATE TABLE SchemaInfo (                                               \
        version INTEGER                                                  \
@@ -170,9 +176,61 @@ int query_callback(void *a_param, int argc, char **argv, char **column)
   return 0;
 }
 
+struct SourceLine
+{
+  int source_path_id;
+  int lineno;
+
+  SourceLine(int source_path_id, int lineno)
+    : source_path_id(source_path_id), lineno(lineno) {}
+
+  bool operator<(const SourceLine& right) const {
+    return source_path_id < right.source_path_id && lineno < right.lineno;
+  }
+};
+std::map<SourceLine, int> source_lines_map;
+
+struct SymbolName
+{
+  std::string short_name;
+  std::string full_name;
+
+  SymbolName(std::string short_name, std::string full_name)
+    : short_name(short_name), full_name(full_name) {}
+
+  bool operator<(const SymbolName& right) const {
+    return short_name < right.short_name && full_name < right.full_name;
+  }
+};
+std::map<SymbolName, int> symbol_names_map;
+
+struct TagDeclaration
+{
+  int symbol_name_id;
+  int kind_id;
+  int is_definition;
+  int is_implicitly_defined;
+
+  TagDeclaration(
+    int symbol_name_id, int kind_id, int is_definition,
+    int is_implicitly_defined)
+    : symbol_name_id(symbol_name_id), kind_id(kind_id),
+      is_definition(is_definition),
+      is_implicitly_defined(is_implicitly_defined) {}
+
+  bool operator<(const TagDeclaration& right) const {
+    return (symbol_name_id < right.symbol_name_id &&
+            kind_id < right.kind_id && is_definition < is_definition &&
+            is_implicitly_defined < right.is_implicitly_defined);
+  }
+};
+std::map<TagDeclaration, int> tag_declarations_map;
+
 class SqliteTagsDatabase : public TagsDatabase
 {
   sqlite3 *database;
+
+  std::ostringstream pending_sql;
 
 public:
   SqliteTagsDatabase(const std::string& path) {
@@ -210,8 +268,26 @@ public:
   }
 
   virtual ~SqliteTagsDatabase() {
+    std::cerr << std::endl << "Executing batch SQL statements...";
+    sqlite3_void_exec(pending_sql.str().c_str());
+    std::cerr << "done" << std::endl;
+
     sql_chk(sqlite3_close(database));
     sql_chk(sqlite3_shutdown());
+  }
+
+  void sqlite3_void_exec(const char * sql)
+  {
+    char * error_msg;
+    try {
+      sql_chk(sqlite3_exec(database, sql, NULL, NULL, &error_msg));
+    }
+    catch (const std::exception& err) {
+      std::cerr << "SQLite3 error: " << error_msg << std::endl;
+      std::cerr << "Error occurred with the following statement: "
+                << std::endl << sql << std::endl;
+      throw;
+    }
   }
 
   long sqlite3_query_for_id(const char * sql)
@@ -261,8 +337,38 @@ public:
 
   virtual void add_declaration(ASTContext *Context, NamedDecl *Declaration)
   {
+    static int DeclarationsFound = 0;
+
     if (Declaration->getNameAsString().empty())
       return;
+
+    int decl_kind_id;
+    int is_implicit = 0;
+    int is_definition = 0;
+
+    if (CXXConstructorDecl *ctorDecl = cast<CXXConstructorDecl>(Declaration)) {
+      decl_kind_id  = 1;
+      is_implicit   = ctorDecl->isImplicitlyDefined();
+      is_definition = ctorDecl->isThisDeclarationADefinition();
+    }
+    else if (
+      CXXDestructorDecl *dtorDecl = cast<CXXDestructorDecl>(Declaration)) {
+      decl_kind_id  = 1;
+      is_implicit   = dtorDecl->isImplicitlyDefined();
+      is_definition = dtorDecl->isThisDeclarationADefinition();
+    }
+    else if (FunctionDecl *functionDecl = cast<FunctionDecl>(Declaration)) {
+      decl_kind_id  = 1;
+      is_definition = functionDecl->isThisDeclarationADefinition();
+    }
+    else if (TagDecl *tagDecl = cast<TagDecl>(Declaration)) {
+      decl_kind_id  = 2;        // jww (2012-05-23): What about enums?
+      is_definition = tagDecl->isThisDeclarationADefinition();
+    }
+    else if (VarDecl *varDecl = cast<VarDecl>(Declaration)) {
+      decl_kind_id  = 3;
+      is_definition = varDecl->isThisDeclarationADefinition();
+    }
 
     FullSourceLoc FullLocation =
       Context->getFullLoc(Declaration->getLocStart());
@@ -299,42 +405,84 @@ public:
         "INSERT INTO SourcePaths (dirname_id, pathname) VALUES (%d, '%q');",
         source_path_dirname_id, file_entry->getName());
 
-    long source_line_id =
-      sqlite3_insert_maybe(
-        "SELECT id FROM SourceLines \
-             WHERE source_path_id = %d AND lineno = %d AND text = '%q'",
-        "INSERT INTO SourceLines (source_path_id, lineno, text) \
-             VALUES (%d, %d, '%q');",
-        source_path_id, FullLocation.getSpellingLineNumber(), LineBuf.c_str());
+    SourceLine source_line(
+      source_path_id, FullLocation.getSpellingLineNumber());
+    std::map<SourceLine, int>::iterator source_line_i =
+      source_lines_map.find(source_line);
 
-    long symbol_name_id =
-      sqlite3_insert_maybe(
-        "SELECT id FROM SymbolNames \
+    long source_line_id;
+    if (source_line_i == source_lines_map.end()) {
+      source_line_id =
+        sqlite3_insert_maybe(
+          "SELECT id FROM SourceLines \
+             WHERE source_path_id = %d AND lineno = %d",
+          "INSERT INTO SourceLines (source_path_id, lineno) \
+             VALUES (%d, %d);",
+          source_line.source_path_id, source_line.lineno);
+
+      source_lines_map.insert(std::make_pair(source_line, source_line_id));
+    } else {
+      source_line_id = (*source_line_i).second;
+    }
+
+    pending_sql << sqlite3_mprintf(
+      "UPDATE SourceLines SET text = '%q' WHERE id = %d;",
+      LineBuf.c_str(), source_line_id);
+
+    SymbolName symbol_name(
+      Declaration->getNameAsString().c_str(),
+      Declaration->getQualifiedNameAsString().c_str());
+    std::map<SymbolName, int>::iterator symbol_name_i =
+      symbol_names_map.find(symbol_name);
+
+    long symbol_name_id;
+    if (symbol_name_i == symbol_names_map.end()) {
+      symbol_name_id =
+        sqlite3_insert_maybe(
+          "SELECT id FROM SymbolNames \
              WHERE short_name = '%q' AND full_name = '%q'",
-        "INSERT INTO SymbolNames (short_name, full_name) \
+          "INSERT INTO SymbolNames (short_name, full_name) \
              VALUES ('%q', '%q');",
-        Declaration->getNameAsString().c_str(),
-        Declaration->getQualifiedNameAsString().c_str());
+          symbol_name.short_name.c_str(), symbol_name.full_name.c_str());
 
-    long declaration_id =
-      sqlite3_insert_maybe(
-        "SELECT id FROM Declarations \
-             WHERE symbol_name_id = %d AND kind_id = %d AND is_definition = %d",
-        "INSERT INTO Declarations (symbol_name_id, kind_id, is_definition) \
-             VALUES (%d, %d, %d);",
-        symbol_name_id, 1, 1);
+      symbol_names_map.insert(std::make_pair(symbol_name, symbol_name_id));
+    } else {
+      symbol_name_id = (*symbol_name_i).second;
+    }
 
-#if 0
-    long decl_ref_id =
-#endif
-      sqlite3_insert_maybe(
-        "SELECT id FROM DeclRefs \
-             WHERE declaration_id = %d AND ref_kind_id = %d AND \
-                   source_line_id = %d AND colno = %d AND is_implicit = %d",
-        "INSERT INTO DeclRefs (declaration_id, ref_kind_id, source_line_id, \
-                               colno, is_implicit) \
-             VALUES (%d, %d, %d, %d, %d);",
-        declaration_id, 1, source_line_id, FullLocation.getSpellingColumnNumber(), 0);
+    TagDeclaration tag_declaration(
+      symbol_name_id, decl_kind_id, is_definition, is_implicit);
+    std::map<TagDeclaration, int>::iterator tag_declaration_i =
+      tag_declarations_map.find(tag_declaration);
+
+    long tag_declaration_id;
+    if (tag_declaration_i == tag_declarations_map.end()) {
+      tag_declaration_id =
+        sqlite3_insert_maybe(
+          "SELECT id FROM Declarations \
+             WHERE symbol_name_id = %d AND kind_id = %d AND \
+                   is_definition = %d AND is_implicitly_defined = %d",
+          "INSERT INTO Declarations (symbol_name_id, kind_id, is_definition, \
+                                     is_implicitly_defined) \
+             VALUES (%d, %d, %d, %d);",
+          tag_declaration.symbol_name_id, tag_declaration.kind_id,
+          tag_declaration.is_definition, tag_declaration.is_implicitly_defined);
+
+      tag_declarations_map.insert(std::make_pair(tag_declaration, tag_declaration_id));
+    } else {
+      tag_declaration_id = (*tag_declaration_i).second;
+    }
+
+    pending_sql << sqlite3_mprintf(
+      "INSERT OR IGNORE INTO DeclRefs ( \
+           declaration_id, ref_kind_id, source_line_id, colno, is_implicit) \
+           VALUES (%d, %d, %d, %d, %d);",
+      tag_declaration_id, is_definition ? 1 : 2, source_line_id,
+      FullLocation.getSpellingColumnNumber(),
+      tag_declaration.is_implicitly_defined);
+
+    if (++DeclarationsFound % 100 == 0)
+      std::cerr << DeclarationsFound << " declarations found\r";
   }
 
   virtual std::vector<TagsDeclInfo> find_declaration(const std::string& name)

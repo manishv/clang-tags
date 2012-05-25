@@ -184,8 +184,19 @@ struct SourceLine
   SourceLine(int source_path_id, int lineno)
     : source_path_id(source_path_id), lineno(lineno) {}
 
+  int compare(const SourceLine& right) const {
+    int diff;
+    diff = source_path_id - right.source_path_id;
+    if (!diff)
+      diff = lineno - right.lineno;
+    return diff;
+  }
+
+  bool operator==(const SourceLine& right) const {
+    return compare(right) == 0;
+  }
   bool operator<(const SourceLine& right) const {
-    return source_path_id < right.source_path_id && lineno < right.lineno;
+    return compare(right) < 0;
   }
 };
 std::map<SourceLine, int> source_lines_map;
@@ -198,33 +209,57 @@ struct SymbolName
   SymbolName(std::string short_name, std::string full_name)
     : short_name(short_name), full_name(full_name) {}
 
+  int compare(const SymbolName& right) const {
+    int diff;
+    diff = short_name.compare(right.short_name);
+    if (!diff)
+      diff = full_name.compare(right.full_name);
+    return diff;
+  }
+
+  bool operator==(const SymbolName& right) const {
+    return compare(right) == 0;
+  }
   bool operator<(const SymbolName& right) const {
-    return short_name < right.short_name && full_name < right.full_name;
+    return compare(right) < 0;
   }
 };
 std::map<SymbolName, int> symbol_names_map;
 
-struct TagDeclaration
+struct TDeclaration
 {
   int symbol_name_id;
   int kind_id;
   int is_definition;
   int is_implicitly_defined;
 
-  TagDeclaration(
+  TDeclaration(
     int symbol_name_id, int kind_id, int is_definition,
     int is_implicitly_defined)
     : symbol_name_id(symbol_name_id), kind_id(kind_id),
       is_definition(is_definition),
       is_implicitly_defined(is_implicitly_defined) {}
 
-  bool operator<(const TagDeclaration& right) const {
-    return (symbol_name_id < right.symbol_name_id &&
-            kind_id < right.kind_id && is_definition < is_definition &&
-            is_implicitly_defined < right.is_implicitly_defined);
+  int compare(const TDeclaration& right) const {
+    int diff;
+    diff = symbol_name_id - right.symbol_name_id;
+    if (!diff)
+      diff = kind_id - right.kind_id;
+    if (!diff)
+      diff = is_definition - right.is_definition;
+    if (!diff)
+      diff = is_implicitly_defined - right.is_implicitly_defined;
+    return diff;
+  }
+
+  bool operator==(const TDeclaration& right) const {
+    return compare(right) == 0;
+  }
+  bool operator<(const TDeclaration& right) const {
+    return compare(right) < 0;
   }
 };
-std::map<TagDeclaration, int> tag_declarations_map;
+std::map<TDeclaration, int> tdeclarations_map;
 
 class SqliteTagsDatabase : public TagsDatabase
 {
@@ -337,13 +372,13 @@ public:
 
   virtual void add_declaration(ASTContext *Context, NamedDecl *Declaration)
   {
-    static int DeclarationsFound = 0;
+    static int DeclarationsRecorded = 0;
 
     if (Declaration->getNameAsString().empty())
       return;
 
-    int decl_kind_id;
-    int is_implicit = 0;
+    int decl_kind_id  = 1;
+    int is_implicit   = 0;
     int is_definition = 0;
 
     if (CXXConstructorDecl *ctorDecl = cast<CXXConstructorDecl>(Declaration)) {
@@ -416,18 +451,14 @@ public:
         sqlite3_insert_maybe(
           "SELECT id FROM SourceLines \
              WHERE source_path_id = %d AND lineno = %d",
-          "INSERT INTO SourceLines (source_path_id, lineno) \
-             VALUES (%d, %d);",
-          source_line.source_path_id, source_line.lineno);
+          "INSERT INTO SourceLines (source_path_id, lineno, text) \
+             VALUES (%d, %d, '%q');",
+          source_line.source_path_id, source_line.lineno, LineBuf.c_str());
 
       source_lines_map.insert(std::make_pair(source_line, source_line_id));
     } else {
       source_line_id = (*source_line_i).second;
     }
-
-    pending_sql << sqlite3_mprintf(
-      "UPDATE SourceLines SET text = '%q' WHERE id = %d;",
-      LineBuf.c_str(), source_line_id);
 
     SymbolName symbol_name(
       Declaration->getNameAsString().c_str(),
@@ -450,14 +481,14 @@ public:
       symbol_name_id = (*symbol_name_i).second;
     }
 
-    TagDeclaration tag_declaration(
+    TDeclaration tdeclaration(
       symbol_name_id, decl_kind_id, is_definition, is_implicit);
-    std::map<TagDeclaration, int>::iterator tag_declaration_i =
-      tag_declarations_map.find(tag_declaration);
+    std::map<TDeclaration, int>::iterator tdeclaration_i =
+      tdeclarations_map.find(tdeclaration);
 
-    long tag_declaration_id;
-    if (tag_declaration_i == tag_declarations_map.end()) {
-      tag_declaration_id =
+    long tdeclaration_id;
+    if (tdeclaration_i == tdeclarations_map.end()) {
+      tdeclaration_id =
         sqlite3_insert_maybe(
           "SELECT id FROM Declarations \
              WHERE symbol_name_id = %d AND kind_id = %d AND \
@@ -465,24 +496,24 @@ public:
           "INSERT INTO Declarations (symbol_name_id, kind_id, is_definition, \
                                      is_implicitly_defined) \
              VALUES (%d, %d, %d, %d);",
-          tag_declaration.symbol_name_id, tag_declaration.kind_id,
-          tag_declaration.is_definition, tag_declaration.is_implicitly_defined);
+          tdeclaration.symbol_name_id, tdeclaration.kind_id,
+          tdeclaration.is_definition, tdeclaration.is_implicitly_defined);
 
-      tag_declarations_map.insert(std::make_pair(tag_declaration, tag_declaration_id));
+      tdeclarations_map.insert(std::make_pair(tdeclaration, tdeclaration_id));
     } else {
-      tag_declaration_id = (*tag_declaration_i).second;
+      tdeclaration_id = (*tdeclaration_i).second;
     }
 
     pending_sql << sqlite3_mprintf(
       "INSERT OR IGNORE INTO DeclRefs ( \
            declaration_id, ref_kind_id, source_line_id, colno, is_implicit) \
            VALUES (%d, %d, %d, %d, %d);",
-      tag_declaration_id, is_definition ? 1 : 2, source_line_id,
+      tdeclaration_id, is_definition ? 1 : 2, source_line_id,
       FullLocation.getSpellingColumnNumber(),
-      tag_declaration.is_implicitly_defined);
+      tdeclaration.is_implicitly_defined);
 
-    if (++DeclarationsFound % 100 == 0)
-      std::cerr << DeclarationsFound << " declarations found\r";
+    if (++DeclarationsRecorded % 100 == 0)
+      std::cerr << DeclarationsRecorded << " declarations recorded\r";
   }
 
   virtual std::vector<TagsDeclInfo> find_declaration(const std::string& name)

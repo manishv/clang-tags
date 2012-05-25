@@ -307,8 +307,8 @@ public:
     sqlite3_void_exec(pending_sql.str().c_str());
     std::cerr << "done" << std::endl;
 
-    sql_chk(sqlite3_close(database));
-    sql_chk(sqlite3_shutdown());
+    sqlite3_close(database);
+    sqlite3_shutdown();
   }
 
   void sqlite3_void_exec(const char * sql)
@@ -362,10 +362,14 @@ public:
     va_list argslist;
     va_start(argslist, insert_sql);
 
-    long id = sqlite3_query_for_id(sqlite3_vmprintf(select_sql, argslist));
+    char *sql = sqlite3_vmprintf(select_sql, argslist);
+    long id = sqlite3_query_for_id(sql);
+    sqlite3_free(sql);
     if (id == -1) {
       va_start(argslist, insert_sql);
-      id = sqlite3_insert_new(sqlite3_vmprintf(insert_sql, argslist));
+      sql = sqlite3_vmprintf(insert_sql, argslist);
+      id = sqlite3_insert_new(sql);
+      sqlite3_free(sql);
     }
     return id;
   }
@@ -504,13 +508,15 @@ public:
       tdeclaration_id = (*tdeclaration_i).second;
     }
 
-    pending_sql << sqlite3_mprintf(
+    char * sql = sqlite3_mprintf(
       "INSERT OR IGNORE INTO DeclRefs ( \
            declaration_id, ref_kind_id, source_line_id, colno, is_implicit) \
            VALUES (%d, %d, %d, %d, %d);",
       tdeclaration_id, is_definition ? 1 : 2, source_line_id,
       FullLocation.getSpellingColumnNumber(),
       tdeclaration.is_implicitly_defined);
+    pending_sql << sql;
+    sqlite3_free(sql);
 
     if (++DeclarationsRecorded % 100 == 0)
       std::cerr << DeclarationsRecorded << " declarations recorded\r";
@@ -566,11 +572,13 @@ AND Declarations.symbol_name_id =                       \
       }
 
       sql_chk(sqlite3_finalize(stmt));
+      sqlite3_free(sql);
       return tags;
     }
     catch (const std::exception& err) {
       std::cerr << "Error occurred with the following query: "
                 << std::endl << sql << std::endl;
+      sqlite3_free(sql);
       throw;
     }
   }

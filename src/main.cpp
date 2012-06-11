@@ -10,6 +10,7 @@
 #include <sstream>
 #include <iostream>
 #include <vector>
+#include <cassert>
 
 #include <sqlite3.h>
 #include <sys/unistd.h>
@@ -21,11 +22,11 @@ using namespace tooling;
 class TagsDeclInfo
 {
 public:
-  int id;
+  int         id;
   std::string filename;
   std::string text;
-  int line_no;
-  int col_no;
+  int         line_no;
+  int         col_no;
   std::string name;
 };
 
@@ -266,9 +267,12 @@ class SqliteTagsDatabase : public TagsDatabase
   sqlite3 *database;
 
   std::ostringstream pending_sql;
+  int DeclarationsCounted;
 
 public:
-  SqliteTagsDatabase(const std::string& path) {
+  explicit SqliteTagsDatabase(const std::string& path)
+    : DeclarationsCounted(0)
+  {
     sql_chk(sqlite3_initialize());
 
     bool exists = false;
@@ -376,8 +380,6 @@ public:
 
   virtual void add_declaration(ASTContext *Context, NamedDecl *Declaration)
   {
-    static int DeclarationsRecorded = 0;
-
     if (Declaration->getNameAsString().empty())
       return;
 
@@ -385,63 +387,77 @@ public:
     int is_implicit   = 0;
     int is_definition = 0;
 
-    if (CXXConstructorDecl *ctorDecl = cast<CXXConstructorDecl>(Declaration)) {
-      decl_kind_id  = 1;
-      is_implicit   = ctorDecl->isImplicitlyDefined();
-      is_definition = ctorDecl->isThisDeclarationADefinition();
+    if (isa<FunctionDecl>(Declaration)) {
+      if (isa<CXXConstructorDecl>(Declaration)) {
+        CXXConstructorDecl * ctorDecl = cast<CXXConstructorDecl>(Declaration);
+        decl_kind_id  = 1;
+        is_implicit   = ctorDecl->isImplicitlyDefined();
+        is_definition = ctorDecl->isThisDeclarationADefinition();
+      }
+      else if (isa<CXXDestructorDecl>(Declaration)) {
+        CXXDestructorDecl * dtorDecl = cast<CXXDestructorDecl>(Declaration);
+        decl_kind_id  = 1;
+        is_implicit   = dtorDecl->isImplicitlyDefined();
+        is_definition = dtorDecl->isThisDeclarationADefinition();
+      }
+      else {
+        FunctionDecl * functionDecl = cast<FunctionDecl>(Declaration);
+        decl_kind_id  = 1;
+        is_definition = functionDecl->isThisDeclarationADefinition();
+      }
     }
-    else if (
-      CXXDestructorDecl *dtorDecl = cast<CXXDestructorDecl>(Declaration)) {
-      decl_kind_id  = 1;
-      is_implicit   = dtorDecl->isImplicitlyDefined();
-      is_definition = dtorDecl->isThisDeclarationADefinition();
-    }
-    else if (FunctionDecl *functionDecl = cast<FunctionDecl>(Declaration)) {
-      decl_kind_id  = 1;
-      is_definition = functionDecl->isThisDeclarationADefinition();
-    }
-    else if (TagDecl *tagDecl = cast<TagDecl>(Declaration)) {
+    else if (isa<TagDecl>(Declaration)) {
+      TagDecl * tagDecl = cast<TagDecl>(Declaration);
       decl_kind_id  = 2;        // jww (2012-05-23): What about enums?
       is_definition = tagDecl->isThisDeclarationADefinition();
     }
-    else if (VarDecl *varDecl = cast<VarDecl>(Declaration)) {
+    else if (isa<VarDecl>(Declaration)) {
+      VarDecl * varDecl = cast<VarDecl>(Declaration);
       decl_kind_id  = 3;
       is_definition = varDecl->isThisDeclarationADefinition();
     }
 
     FullSourceLoc FullLocation =
       Context->getFullLoc(Declaration->getLocStart());
+    std::pair<FileID, unsigned> LocInfo = FullLocation.getDecomposedLoc();
 
     FileID file_id = FullLocation.getFileID();
     const FileEntry * file_entry =
       FullLocation.getManager().getFileEntryForID(file_id);
-    if (! file_entry)
+    if (!file_entry)
       return;
 
-    std::pair<FileID, unsigned> LocInfo = FullLocation.getDecomposedLoc();
+    bool InvalidFile = false;
+    const llvm::MemoryBuffer * Buffer =
+      FullLocation.getManager().getBuffer(LocInfo.first, &InvalidFile);
+    if (InvalidFile || !Buffer)
+      return;
 
-    const llvm::MemoryBuffer *Buffer      = FullLocation.getBuffer();
-    const char *              BufferStart = Buffer->getBufferStart();
-    std::size_t offset                    =
+    std::size_t offset =
       LocInfo.second - (FullLocation.getSpellingColumnNumber() - 1);
-
+    const char * BufferStart = Buffer->getBufferStart();
+    const char * BufferEnd = Buffer->getBufferEnd();
     const char * LineBegin = BufferStart + offset;
+    if (LineBegin >= BufferEnd)
+      throw std::runtime_error("Buffer invalid");
     const char * LineEnd = LineBegin;
-    while (*LineEnd && *LineEnd != '\n')
+    while (*LineEnd && *LineEnd != '\n') {
       ++LineEnd;
-
+      if (LineEnd >= BufferEnd)
+        throw std::runtime_error("Buffer invalid");
+    }
     std::string LineBuf(LineBegin, LineEnd);
 
     long source_path_dirname_id =
       sqlite3_insert_maybe(
-        "SELECT id FROM SourcePaths WHERE pathname = '%q'",
-        "INSERT INTO SourcePaths (pathname) VALUES ('%q');",
+        "SELECT id FROM SourcePaths WHERE pathname = %Q",
+        "INSERT INTO SourcePaths (pathname) VALUES (%Q);",
         file_entry->getDir()->getName());
 
     long source_path_id =
       sqlite3_insert_maybe(
-        "SELECT id FROM SourcePaths WHERE dirname_id = %d AND pathname = '%q'",
-        "INSERT INTO SourcePaths (dirname_id, pathname) VALUES (%d, '%q');",
+        "SELECT id FROM SourcePaths WHERE dirname_id = %d AND pathname = %Q",
+        "INSERT INTO SourcePaths (dirname_id, pathname) VALUES (%d, %Q);",
         source_path_dirname_id, file_entry->getName());
 
     SourceLine source_line(
@@ -456,7 +472,7 @@ public:
           "SELECT id FROM SourceLines \
              WHERE source_path_id = %d AND lineno = %d",
           "INSERT INTO SourceLines (source_path_id, lineno, text) \
-             VALUES (%d, %d, '%q');",
+             VALUES (%d, %d, %Q);",
           source_line.source_path_id, source_line.lineno, LineBuf.c_str());
 
       source_lines_map.insert(std::make_pair(source_line, source_line_id));
@@ -475,9 +491,9 @@ public:
       symbol_name_id =
         sqlite3_insert_maybe(
           "SELECT id FROM SymbolNames \
-             WHERE short_name = '%q' AND full_name = '%q'",
+             WHERE short_name = %Q AND full_name = %Q",
           "INSERT INTO SymbolNames (short_name, full_name) \
-             VALUES ('%q', '%q');",
+             VALUES (%Q, %Q);",
           symbol_name.short_name.c_str(), symbol_name.full_name.c_str());
 
       symbol_names_map.insert(std::make_pair(symbol_name, symbol_name_id));
@@ -518,8 +534,8 @@ public:
     pending_sql << sql;
     sqlite3_free(sql);
 
-    if (++DeclarationsRecorded % 100 == 0)
-      std::cerr << DeclarationsRecorded << " declarations recorded\r";
+    if (++DeclarationsCounted % 100 == 0)
+      std::cerr << DeclarationsCounted << " declarations counted\r";
   }
 
   virtual std::vector<TagsDeclInfo> find_declaration(const std::string& name)
@@ -549,7 +565,7 @@ AND Declarations.symbol_name_id =                       \
         FROM                                            \
             SymbolNames                                 \
         WHERE                                           \
-            full_name = '%q');", name.c_str());
+            full_name = %Q);", name.c_str());
 
     try {
       sqlite3_stmt *stmt;
@@ -562,8 +578,8 @@ AND Declarations.symbol_name_id =                       \
         info.id       = sqlite3_column_int(stmt, 0);
         info.filename =
           (std::string(
-            reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)))
-           + "/" + reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2)));
+            reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1))) +
+           "/" + reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2)));
         info.line_no  = sqlite3_column_int(stmt, 3);
         info.col_no   = sqlite3_column_int(stmt, 4);
         info.text     = (reinterpret_cast<const char *>(

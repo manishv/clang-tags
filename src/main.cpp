@@ -15,6 +15,10 @@
 #include <sqlite3.h>
 #include <sys/unistd.h>
 
+#if !defined(__has_feature) || !__has_feature(address_sanitizer)
+#define HAVE_EXCEPTIONS 1
+#endif
+
 using namespace llvm;
 using namespace clang;
 using namespace tooling;
@@ -40,8 +44,10 @@ public:
 };
 
 inline void sql_chk(int return_code) {
+#ifdef HAVE_EXCEPTIONS
   if (return_code != SQLITE_OK)
     throw std::runtime_error("SQLite3 call failed");
+#endif
 }
 
 const char * tags_sql = "\
@@ -273,21 +279,29 @@ public:
   explicit SqliteTagsDatabase(const std::string& path)
     : DeclarationsCounted(0)
   {
+#ifdef USE_SQLITE3
     sql_chk(sqlite3_initialize());
 
     bool exists = false;
     if (access(path.c_str(), R_OK) == 0)
       exists = true;
 
+#ifdef HAVE_EXCEPTIONS
     try {
+#endif
       sql_chk(sqlite3_open(path.c_str(), &database));
 
+#ifdef HAVE_EXCEPTIONS
       try {
+#endif
         if (! exists) {
           char * error_msg;
+#ifdef HAVE_EXCEPTIONS
           try {
+#endif
             sql_chk(sqlite3_exec(
                       database, tags_sql, NULL, NULL, &error_msg));
+#ifdef HAVE_EXCEPTIONS
           }
           catch (const std::exception& err) {
             std::cerr << "SQLite3 error: " << error_msg << std::endl;
@@ -304,22 +318,29 @@ public:
     catch (...) {
       sqlite3_shutdown();
     }
+#endif
+#endif
   }
 
   virtual ~SqliteTagsDatabase() {
+#ifdef USE_SQLITE3
     std::cerr << std::endl << "Executing batch SQL statements...";
     sqlite3_void_exec(pending_sql.str().c_str());
     std::cerr << "done" << std::endl;
 
     sqlite3_close(database);
     sqlite3_shutdown();
+#endif
   }
 
   void sqlite3_void_exec(const char * sql)
   {
     char * error_msg;
+#ifdef HAVE_EXCEPTIONS
     try {
+#endif
       sql_chk(sqlite3_exec(database, sql, NULL, NULL, &error_msg));
+#ifdef HAVE_EXCEPTIONS
     }
     catch (const std::exception& err) {
       std::cerr << "SQLite3 error: " << error_msg << std::endl;
@@ -327,15 +348,19 @@ public:
                 << std::endl << sql << std::endl;
       throw;
     }
+#endif
   }
 
   long sqlite3_query_for_id(const char * sql)
   {
     char * error_msg;
+#ifdef HAVE_EXCEPTIONS
     try {
+#endif
       long id = -1;
       sql_chk(sqlite3_exec(database, sql, query_callback, &id, &error_msg));
       return id;
+#ifdef HAVE_EXCEPTIONS
     }
     catch (const std::exception& err) {
       std::cerr << "SQLite3 error: " << error_msg << std::endl;
@@ -343,14 +368,18 @@ public:
                 << std::endl << sql << std::endl;
       throw;
     }
+#endif
   }
 
   long sqlite3_insert_new(const char * sql)
   {
     char * error_msg;
+#ifdef HAVE_EXCEPTIONS
     try {
+#endif
       sql_chk(sqlite3_exec(database, sql, NULL, NULL, &error_msg));
       return static_cast<long>(sqlite3_last_insert_rowid(database));
+#ifdef HAVE_EXCEPTIONS
     }
     catch (const std::exception& err) {
       std::cerr << "SQLite3 error: " << error_msg << std::endl;
@@ -358,11 +387,13 @@ public:
                 << std::endl << sql << std::endl;
       throw;
     }
+#endif
   }
 
   long sqlite3_insert_maybe(
     const char * select_sql, const char * insert_sql, ...)
   {
+#ifdef USE_SQLITE3
     va_list argslist;
     va_start(argslist, insert_sql);
 
@@ -375,6 +406,9 @@ public:
       id = sqlite3_insert_new(sql);
       sqlite3_free(sql);
     }
+#else
+    long id =1;
+#endif
     return id;
   }
 
@@ -439,13 +473,17 @@ public:
     const char * BufferStart = Buffer->getBufferStart();
     const char * BufferEnd = Buffer->getBufferEnd();
     const char * LineBegin = BufferStart + offset;
+#ifdef HAVE_EXCEPTIONS
     if (LineBegin >= BufferEnd)
       throw std::runtime_error("Buffer invalid");
+#endif
     const char * LineEnd = LineBegin;
     while (*LineEnd && *LineEnd != '\n') {
       ++LineEnd;
+#ifdef HAVE_EXCEPTIONS
       if (LineEnd >= BufferEnd)
         throw std::runtime_error("Buffer invalid");
+#endif
     }
     std::string LineBuf(LineBegin, LineEnd);
 
@@ -525,6 +563,7 @@ public:
       tdeclaration_id = (*tdeclaration_i).second;
     }
 
+#ifdef USE_SQLITE3
     char * sql = sqlite3_mprintf(
       "INSERT OR IGNORE INTO DeclRefs ( \
            declaration_id, ref_kind_id, source_line_id, colno, is_implicit) \
@@ -534,6 +573,7 @@ public:
       tdeclaration.is_implicitly_defined);
     pending_sql << sql;
     sqlite3_free(sql);
+#endif
 
     if (++DeclarationsCounted % 100 == 0)
       std::cerr << DeclarationsCounted << " declarations counted\r";
@@ -568,7 +608,9 @@ AND Declarations.symbol_name_id =                       \
         WHERE                                           \
             full_name = %Q);", name.c_str());
 
+#ifdef HAVE_EXCEPTIONS
     try {
+#endif
       sqlite3_stmt *stmt;
       sql_chk(sqlite3_prepare(database, sql, std::strlen(sql), &stmt, NULL));
 
@@ -591,6 +633,7 @@ AND Declarations.symbol_name_id =                       \
       sql_chk(sqlite3_finalize(stmt));
       sqlite3_free(sql);
       return tags;
+#ifdef HAVE_EXCEPTIONS
     }
     catch (const std::exception& err) {
       std::cerr << "Error occurred with the following query: "
@@ -598,6 +641,7 @@ AND Declarations.symbol_name_id =                       \
       sqlite3_free(sql);
       throw;
     }
+#endif
   }
 };
 

@@ -33,7 +33,7 @@ public:
 class TagsDatabase
 {
 public:
-  virtual void add_declaration(ASTContext *Context, NamedDecl *Declaration) = 0;
+  virtual void add_declaration(NamedDecl *Declaration) = 0;
 
   virtual std::vector<TagsDeclInfo>
   find_declaration(const std::string& name) = 0;
@@ -378,10 +378,12 @@ public:
     return id;
   }
 
-  virtual void add_declaration(ASTContext *Context, NamedDecl *Declaration)
+  virtual void add_declaration(NamedDecl *Declaration)
   {
     if (Declaration->getNameAsString().empty())
       return;
+
+    ASTContext& Context(Declaration->getASTContext());
 
     int decl_kind_id  = 1;
     int is_implicit   = 0;
@@ -417,8 +419,7 @@ public:
       is_definition = varDecl->isThisDeclarationADefinition();
     }
 
-    FullSourceLoc FullLocation =
-      Context->getFullLoc(Declaration->getLocStart());
+    FullSourceLoc FullLocation = Context.getFullLoc(Declaration->getLocStart());
     std::pair<FileID, unsigned> LocInfo = FullLocation.getDecomposedLoc();
 
     FileID file_id = FullLocation.getFileID();
@@ -605,24 +606,19 @@ class TagsClassVisitor : public RecursiveASTVisitor<TagsClassVisitor>
   TagsDatabase& tags_db;
 
 public:
-  explicit TagsClassVisitor(ASTContext *Context, TagsDatabase& db)
-    : tags_db(db), Context(Context) {}
+  explicit TagsClassVisitor(TagsDatabase& db) : tags_db(db) {}
   virtual ~TagsClassVisitor() {}
 
   bool VisitNamedDecl(NamedDecl *Declaration) {
-    tags_db.add_declaration(Context, Declaration);
+    tags_db.add_declaration(Declaration);
     return true;
   }
-
-private:
-  ASTContext *Context;
 };
 
 class TagsClassConsumer : public ASTConsumer
 {
 public:
-  explicit TagsClassConsumer(ASTContext *Context, TagsDatabase& db)
-    : Visitor(Context, db) {}
+  explicit TagsClassConsumer(TagsDatabase& db) : Visitor(db) {}
   virtual ~TagsClassConsumer() {}
 
   virtual void HandleTranslationUnit(ASTContext& Context) {
@@ -641,9 +637,8 @@ public:
   TagsClassAction(TagsDatabase& db) : db(db) {}
   virtual ~TagsClassAction() {}
 
-  virtual ASTConsumer *CreateASTConsumer(
-    CompilerInstance& Compiler, llvm::StringRef InFile) {
-    return new TagsClassConsumer(&Compiler.getASTContext(), db);
+  virtual ASTConsumer *CreateASTConsumer(CompilerInstance&, llvm::StringRef) {
+    return new TagsClassConsumer(db);
   }
 };
 

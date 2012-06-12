@@ -427,14 +427,14 @@ public:
       if (isa<CXXConstructorDecl>(Declaration)) {
         CXXConstructorDecl * ctorDecl = cast<CXXConstructorDecl>(Declaration);
         decl_kind_id  = 1;
-        is_implicit   = ctorDecl->isImplicitlyDefined();
         is_definition = ctorDecl->isThisDeclarationADefinition();
+        is_implicit   = is_definition && ctorDecl->isImplicitlyDefined();
       }
       else if (isa<CXXDestructorDecl>(Declaration)) {
         CXXDestructorDecl * dtorDecl = cast<CXXDestructorDecl>(Declaration);
         decl_kind_id  = 1;
-        is_implicit   = dtorDecl->isImplicitlyDefined();
         is_definition = dtorDecl->isThisDeclarationADefinition();
+        is_implicit   = is_definition && dtorDecl->isImplicitlyDefined();
       }
       else {
         FunctionDecl * functionDecl = cast<FunctionDecl>(Declaration);
@@ -454,6 +454,9 @@ public:
     }
 
     FullSourceLoc FullLocation = Context.getFullLoc(Declaration->getLocStart());
+    if (!FullLocation.isValid())
+      return;
+
     std::pair<FileID, unsigned> LocInfo = FullLocation.getDecomposedLoc();
 
     FileID file_id = FullLocation.getFileID();
